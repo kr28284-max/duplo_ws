@@ -1,3 +1,4 @@
+import os
 from setuptools import find_packages, setup
 
 package_name = 'vision_pkg'
@@ -13,18 +14,20 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='da',
-    maintainer_email='da@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer='scr',
+    maintainer_email='scr@todo.todo',
+    description='Vision package',
+    license='Apache-2.0',
     extras_require={
-        'test': [
-            'pytest',
-        ],
+        'test': ['pytest'],
     },
     entry_points={
         'console_scripts': [
-            'vision_6Dpose_node = vision_pkg.vision_6Dpose_node:main'
+            'vision_node = vision_pkg.vision_node:main',
+            'vision_node2 = vision_pkg.vision_node2:main',
         ],
+    },
+    package_data={
+        package_name: ['models/*.pt'],
     },
 )

@@ -3,9 +3,12 @@
 <package format="3">
   <name>vision_pkg</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="da@todo.todo">da</maintainer>
-  <license>TODO: License declaration</license>
+  <description>Vision package</description>
+  <maintainer email="scr@todo.todo">scr</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>srv_pkg</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

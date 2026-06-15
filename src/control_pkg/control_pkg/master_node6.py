@@ -246,7 +246,7 @@ class MasterNode(Node):
             'big_tree': {'2x2_yellow': 1, '2x2_red': 2, '4x2_red': 2}
         }
         best_plan = []
-        min_remainder = sum(current_inventory.values())b
+        min_remainder = sum(current_inventory.values())
 
         def dfs(inv, current_plan):
             nonlocal best_plan, min_remainder

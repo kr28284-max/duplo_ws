@@ -13,9 +13,9 @@ class MasterNode(Node):
         self.cli_g = self.create_client(SetBool, '/control_gripper')
         self.cli_h = self.create_client(Trigger, '/robot_home')
        
-        self.Z_OFF = -85.0
+        self.Z_OFF = -95.0 //85
         self.Z_MARGIN = 20.0
-        self.BLOCK_H = 16.0
+        self.BLOCK_H = 20.0  //16
         self.WAIT_TIME = 1.5
        
         self.STUD_PITCH = 0.016

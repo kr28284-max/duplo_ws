@@ -13,16 +13,19 @@ class MasterNode(Node):
         self.cli_g = self.create_client(SetBool, '/control_gripper')
         self.cli_h = self.create_client(Trigger, '/robot_home')
        
-        self.Z_OFF = -100.0
-        self.Z_MARGIN = 20.0
-        self.BLOCK_H = 16.0
+        # 8번 코드 오프셋 및 환경설정 반영
+        self.Z_OFF = -95.0
+        self.Z_MARGIN = 25.0
+        self.BLOCK_H = 20.0
         self.WAIT_TIME = 1.5
-        self.PRE_XY_LOWER = 70.0  # 🌟 분해 코드의 robot1_pre_xy_lower_mm (70.0) 하강값 추가
+        self.PRE_XY_LOWER = 70.0
+        self.Z_PRE_LOWER_MARGIN = 220.0 # 목표물 위에서 미리 하강할 안전 여유 높이 (mm)
        
         self.STUD_PITCH = 0.016
-        self.YAW_TUNE = 0.0  # 필요시 여기서 영점 조절 (예: -1.5)
+        self.YAW_TUNE = 0.0
+        self.TWO_BY_TWO_YAW_FOLD_DEG = 2.0
 
-        # vision_node.py는 target_color로 클래스명이 아니라 숫자 ID 문자열만 받는다.
+        # 8번 코드 인지 매핑
         self.CLASS_TO_TARGET_ID = {
             "2x2_red": "1",
             "2x2_green": "2",
@@ -39,7 +42,6 @@ class MasterNode(Node):
             "assembly": "999",
         }
        
-        # 🌟 가장 깨끗하게 인식되었을 때의 타겟 좌표를 기억하는 변수
         self.last_perfect_pose = None
 
     def call(self, cli, req):
@@ -70,214 +72,107 @@ class MasterNode(Node):
             GetTargetPose.Request(target_color=self.to_vision_target_id(target))
         )
 
-    def count_color(self, color):
-        p = self.request_target_pose(color)
-        return 1 if p.success else 0
-
-    def find_target_with_retry(self, color, retries=4):
-        # for i in range(retries):
-        #     p = self.request_target_pose(color)
-        #     if p.success:
-        #         return p
-        #     self.get_logger().warn(f"⚠️ [{color}] 타겟 찾는 중... ({i+1}/{retries})")
-        #     time.sleep(1.0)
-        # return None
+    def find_target_with_retry(self, color):
         p = self.request_target_pose(color)
         if p.success:
             return p
         self.get_logger().error(f"❌ [{color}] 타겟 인식 실패")
         return None
-    
-    def get_dist(self, p1, p2):
-        """두 지점 사이의 평면 거리(m)를 계산"""
-        return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+
+    def normalize_yaw(self, yaw):
+        while yaw > 90.0:
+            yaw -= 180.0
+        while yaw < -90.0:
+            yaw += 180.0
+        return yaw
+
+    def is_2x2_pose(self, pose):
+        return str(getattr(pose, "class_name", "")).startswith("2x2_")
+
+    def fold_2x2_yaw(self, yaw):
+        yaw = self.normalize_yaw(yaw)
+        if abs(yaw - 90.0) <= self.TWO_BY_TWO_YAW_FOLD_DEG:
+            return yaw - 90.0
+        if abs(yaw + 90.0) <= self.TWO_BY_TWO_YAW_FOLD_DEG:
+            return yaw + 90.0
+        return yaw
 
     # =========================================================================
-    # Big_Tree,Ice_cream만 pick_fresh_target사용
-    # ==========================================================================
-    # def pick_fresh_target(self, color, exclude_pose=None, threshold=0.035, layer_index=0):
-    #     # 🌟 좌표 필터 방식 삭제. 대신 'far_' 접두사를 붙여 로봇이 이동해도 무조건 멀리 있는 블록을 추적
-    #     target_req = f"far_{color}"
-        
-    #     target_p = None
-    #     for i in range(5):
-    #         p = self.request_target_pose(target_req)
-    #         if p.success:
-    #             target_p = p 
-    #             break
-    #         time.sleep(1.0)
+    # 6번 코드 시퀀스 적용 (YAW 회전 후 XY 이동, 스캔 중간값 등)
+    # =========================================================================
+    def pick_target(self, color, layer_index=0, offset_studs_x=0.0, offset_studs_y=0.0):
+        self.get_logger().info(f"\n--- PICK TARGET (정밀 모드): [{color.upper()}] ---")
 
-    #     if not target_p:
-    #         return False
+        # 1. 최초 스캔 및 대략적인 XY 이동
+        self.get_logger().info("1. 최초 스캔 및 중앙으로 대략적인 이동")
+        p1 = self.find_target_with_retry(color)
+        if not p1: return False
 
-    #     # --- 로봇 이동 시작 ---
-    #     # [STEP 1] YAW 회전
-    #     req_y = GetTargetPose.Request(); req_y.yaw = target_p.yaw; req_y.target_size = "YAW"
-    #     self.call(self.cli_r, req_y)
-    #     time.sleep(self.WAIT_TIME)
+        # 🌟 치명적 버그 수정: 블라인드 이동 시 홈(Home) 기준 좌표가 필요하므로 p1을 저장합니다.
+        self.last_perfect_pose = p1
 
-    #     # 🌟 XY 이동 전 Z 선하강 추가 (분해 로직 적용)
-    #     self.get_logger().info(f"⬇️ XY 이동 전 Z {self.PRE_XY_LOWER}mm 선하강")
-    #     self.call(self.cli_r, GetTargetPose.Request(z=self.PRE_XY_LOWER, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
+        # 🌟 관절 한계 도달 방지: 목표물 위 150mm 지점까지 Z축 미리 하강
+        z_move_total_initial = (p1.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        z_pre_to_move = z_move_total_initial - self.Z_PRE_LOWER_MARGIN
+        z_already_moved = 0.0
+        if z_pre_to_move > 0:
+            self.get_logger().info(f"...Z축 미리 하강 ({z_pre_to_move:.1f}mm)")
+            self.call(self.cli_r, GetTargetPose.Request(z=z_pre_to_move, target_size="Z"))
+            time.sleep(self.WAIT_TIME)
+            z_already_moved = z_pre_to_move
 
-    #     # 🌟 [STEP 2] XY 이동 (회전 후에도 가까운 베이스 무시하고 계속 멀리 있는 블록 추적)
-    #     p_retry = self.find_target_with_retry(target_req)
-    #     if not p_retry: return False
-    #     req_xy = GetTargetPose.Request(); req_xy.x = p_retry.x; req_xy.y = p_retry.y; req_xy.target_size = "XY"
-    #     self.call(self.cli_r, req_xy)
-    #     time.sleep(self.WAIT_TIME)
+        req_xy1 = GetTargetPose.Request(x=p1.x, y=p1.y, target_size="XY")
+        self.call(self.cli_r, req_xy1)
+        time.sleep(self.WAIT_TIME)
+        self.get_logger().info("...대략적인 중앙 이동 완료.")
 
-    #     # [STEP 3] Z 하강 및 집기
-    #     p_z = self.find_target_with_retry(target_req)
-    #     if not p_z: return False
-        
-    #     z_move = (p_z.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
+        # 2. 중앙에서 정밀 재스캔
+        self.get_logger().info("2. 중앙에서 정밀 재스캔 (X, Y, Z, Yaw)")
+        p2 = self.find_target_with_retry(color)
+        if not p2: return False
 
-    #     self.call(self.cli_g, SetBool.Request(data=True))
-    #     time.sleep(self.WAIT_TIME)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=-50.0, target_size="Z"))
-    #     return True
-    def pick_fresh_target(self, color, exclude_pose=None, threshold=0.035, layer_index=0):
-        target_req = f"far_{color}"
-        
-        # [1번째 스캔] 홈 위치에서 멀리 있는 타겟 최초 스캔
-        # target_p = None
-        # for i in range(5):
-        #     p = self.request_target_pose(target_req)
-        #     if p.success:
-        #         target_p = p 
-        #         break
-        #     time.sleep(1.0)
-        # 5번 재시도 루프 제거 -> 1회만 즉시 스캔
-        target_p = self.request_target_pose(target_req)
-        if not target_p.success:
-            return False
+        # 3. YAW 회전
+        self.get_logger().info("3. YAW 정렬 시작")
+        target_yaw = p2.yaw + self.YAW_TUNE
+        if self.is_2x2_pose(p2) or color.startswith("2x2_"):
+            target_yaw = self.fold_2x2_yaw(target_yaw)
+        else:
+            target_yaw = self.normalize_yaw(target_yaw)
 
-        if not target_p:
-            return False
-
-        # --- 로봇 이동 시작 ---
-        # [STEP 1] YAW 회전
-        req_y = GetTargetPose.Request(); req_y.yaw = target_p.yaw; req_y.target_size = "YAW"
+        req_y = GetTargetPose.Request(yaw=target_yaw, target_size="YAW")
         self.call(self.cli_r, req_y)
         time.sleep(self.WAIT_TIME)
+        self.get_logger().info(f"...YAW 정렬 완료 ({target_yaw:.1f}도)")
 
-        # 🌟 [신규 추가] XY 이동 전 Z 70mm 선하강
-        self.get_logger().info(f"⬇️ XY 이동 전 Z {self.PRE_XY_LOWER}mm 선하강")
-        self.call(self.cli_r, GetTargetPose.Request(z=self.PRE_XY_LOWER, target_size="Z"))
-        time.sleep(self.WAIT_TIME)
-
-        # 🌟 [두 번째 스캔 삭제] 1번째 스캔한 'target_p'의 x, y 좌표를 그대로 적용하여 XY 이동
-        req_xy = GetTargetPose.Request(); req_xy.x = target_p.x; req_xy.y = target_p.y; req_xy.target_size = "XY"
-        self.call(self.cli_r, req_xy)
-        time.sleep(self.WAIT_TIME)
-
-        # 🌟 [세 번째 스캔 유지] Z 하강 직전 최종 스캔하여 정확한 높이 값 확보
-        p_z = self.find_target_with_retry(target_req)
-        if not p_z: return False
+        # 4. YAW 회전 후 최종 XY 위치 재스캔 및 이동
+        self.get_logger().info("4. YAW 정렬 후 최종 XY 좌표 재스캔 및 이동")
+        p3 = self.find_target_with_retry(color)
+        if not p3: return False
         
-        # [STEP 3] Z 하강 및 집기
-        z_move = (p_z.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-        self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
-        time.sleep(self.WAIT_TIME)
-        self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
-        time.sleep(self.WAIT_TIME)
 
-        self.call(self.cli_g, SetBool.Request(data=True))
-        time.sleep(self.WAIT_TIME)
-        self.call(self.cli_r, GetTargetPose.Request(z=-50.0, target_size="Z"))
-        return True
-
-
-    # def pick_target(self, color, layer_index=0, offset_studs_x=0.0, offset_studs_y=0.0, exclude_pose=None):
-    #     self.get_logger().info(f"\n--- PICK TARGET: [{color.upper()}] ---")
-    #     p = self.find_target_with_retry(color)
-    #     if not p: return False
-       
-    #     req = GetTargetPose.Request(); req.yaw = p.yaw; req.target_size = "YAW"
-    #     self.call(self.cli_r, req)
-    #     time.sleep(self.WAIT_TIME)
-
-    #     # 🌟 XY 이동 전 Z 선하강 추가 (분해 로직 적용)
-    #     self.get_logger().info(f"⬇️ XY 이동 전 Z {self.PRE_XY_LOWER}mm 선하강")
-    #     self.call(self.cli_r, GetTargetPose.Request(z=self.PRE_XY_LOWER, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
-
-    #     p = self.find_target_with_retry(color)
-    #     if not p: return False
-
-    #     dx = offset_studs_x * self.STUD_PITCH
-    #     dy = offset_studs_y * self.STUD_PITCH
-    #     yaw_rad = math.radians(p.yaw)
-    #     real_offset_x = dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
-    #     real_offset_y = dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
-
-    #     target_x = p.x + real_offset_x
-    #     target_y = p.y + real_offset_y
-
-    #     req = GetTargetPose.Request(); req.x = target_x; req.y = target_y; req.target_size = "XY"
-    #     self.call(self.cli_r, req)
-    #     time.sleep(self.WAIT_TIME)
-
-    #     p = self.find_target_with_retry(color)
-    #     if not p: return False
-    #     z_move = (p.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
-
-    #     self.call(self.cli_g, SetBool.Request(data=True))
-    #     time.sleep(self.WAIT_TIME)
-    #     self.call(self.cli_r, GetTargetPose.Request(z=-50.0, target_size="Z"))
-    #     time.sleep(self.WAIT_TIME)
-    #     return True
-
-    def pick_target(self, color, layer_index=0, offset_studs_x=0.0, offset_studs_y=0.0, exclude_pose=None):
-        self.get_logger().info(f"\n--- PICK TARGET: [{color.upper()}] ---")
-        
-        # [1번째 스캔] 홈 위치에서 타겟의 전체 좌표(X, Y, Z, Yaw)를 확보
-        p = self.find_target_with_retry(color)
-        if not p: return False
-       
-        # [STEP 1] YAW 회전
-        req = GetTargetPose.Request(); req.yaw = p.yaw; req.target_size = "YAW"
-        self.call(self.cli_r, req)
-        time.sleep(self.WAIT_TIME)
-
-        # 🌟 [신규 추가] XY 이동 전 Z 70mm 선하강
-        self.get_logger().info(f"⬇️ XY 이동 전 Z {self.PRE_XY_LOWER}mm 선하강")
-        self.call(self.cli_r, GetTargetPose.Request(z=self.PRE_XY_LOWER, target_size="Z"))
-        time.sleep(self.WAIT_TIME)
-
-        # 🌟 [두 번째 스캔 삭제] 1번째 스캔한 'p' 변수의 값을 그대로 사용하여 오프셋 계산
         dx = offset_studs_x * self.STUD_PITCH
         dy = offset_studs_y * self.STUD_PITCH
-        yaw_rad = math.radians(p.yaw)
+        yaw_for_offset = self.fold_2x2_yaw(p3.yaw) if (self.is_2x2_pose(p3) or color.startswith("2x2_")) else p3.yaw
+        yaw_rad = math.radians(yaw_for_offset)
         real_offset_x = dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
         real_offset_y = dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
 
-        target_x = p.x + real_offset_x
-        target_y = p.y + real_offset_y
+        target_x = p3.x + real_offset_x
+        target_y = p3.y + real_offset_y
 
-        # [STEP 2] XY 이동 (스캔 없이 바로 첫 번째 좌표로 이동)
-        req = GetTargetPose.Request(); req.x = target_x; req.y = target_y; req.target_size = "XY"
-        self.call(self.cli_r, req)
+        req_xy2 = GetTargetPose.Request(x=target_x, y=target_y, target_size="XY")
+        self.call(self.cli_r, req_xy2)
         time.sleep(self.WAIT_TIME)
+        self.get_logger().info("...최종 XY 이동 완료.")
 
-        # 🌟 [세 번째 스캔 유지] XY 이동 후, 정밀한 Z 하강을 위해 최종 스캔 수행
-        p_z = self.find_target_with_retry(color)
-        if not p_z: return False
+        # 5. Z 하강 및 집기
+        self.get_logger().info("5. Z 하강 및 집기")
+        z_move_total_final = (p3.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        z_remaining = z_move_total_final - z_already_moved
         
-        # 최종 Z 하강 및 집기
-        z_move = (p_z.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-        self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
+        self.call(self.cli_r, GetTargetPose.Request(z=z_remaining - self.Z_MARGIN, target_size="Z"))
         time.sleep(self.WAIT_TIME)
+        
         self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
         time.sleep(self.WAIT_TIME)
 
@@ -287,14 +182,26 @@ class MasterNode(Node):
         time.sleep(self.WAIT_TIME)
         return True
 
-    def blind_insert(self, base_pose, layer_index, yaw_offset=0.0, release_gripper=True, regrip=False, offset_studs_x=0.0, offset_studs_y=0.0):
+    def blind_insert(self, base_pose, layer_index, yaw_offset=0.0, release_gripper=True, offset_studs_x=0.0, offset_studs_y=0.0):
         self.get_logger().info(f"\n--- BLIND STACK (메모리 사용): Layer {layer_index} (Y Offset: {offset_studs_y}) ---")
         time.sleep(1.0)
 
+        # 0. Z 선하강 추가 (관절 한계 도달 방지)
+        z_move_total = (base_pose.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        z_pre = z_move_total - self.Z_PRE_LOWER_MARGIN
+        if z_pre > 0:
+            self.get_logger().info(f"0. Z축 {z_pre:.1f}mm 미리 하강 (목표 {self.Z_PRE_LOWER_MARGIN}mm 상단)")
+            self.call(self.cli_r, GetTargetPose.Request(z=z_pre, target_size="Z"))
+            time.sleep(self.WAIT_TIME)
+        else:
+            z_pre = 0.0
+
+        # 1. XY 이동
         dx = offset_studs_x * self.STUD_PITCH
         dy = offset_studs_y * self.STUD_PITCH
 
-        yaw_rad = math.radians(base_pose.yaw)
+        yaw_for_offset = self.fold_2x2_yaw(base_pose.yaw) if self.is_2x2_pose(base_pose) else base_pose.yaw
+        yaw_rad = math.radians(yaw_for_offset)
         real_offset_x = dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
         real_offset_y = dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
 
@@ -306,9 +213,12 @@ class MasterNode(Node):
         self.call(self.cli_r, req_xy)
         time.sleep(self.WAIT_TIME)
 
+        # 2. YAW 이동
         target_yaw = base_pose.yaw + yaw_offset + self.YAW_TUNE
-        while target_yaw > 90.0: target_yaw -= 180.0
-        while target_yaw < -90.0: target_yaw += 180.0
+        if self.is_2x2_pose(base_pose):
+            target_yaw = self.fold_2x2_yaw(target_yaw)
+        else:
+            target_yaw = self.normalize_yaw(target_yaw)
 
         self.get_logger().info(f"🔄 [YAW 회전] 계산된 고정 각도 회전: {target_yaw:.1f}도")
         req_y = GetTargetPose.Request()
@@ -316,9 +226,10 @@ class MasterNode(Node):
         self.call(self.cli_r, req_y)
         time.sleep(self.WAIT_TIME)
 
-        z_move = (base_pose.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        # 3. Z 이동 (미리 내려온 거리 z_pre를 제외하고 남은 거리만 이동)
+        z_remaining = z_move_total - z_pre
        
-        self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
+        self.call(self.cli_r, GetTargetPose.Request(z=z_remaining - self.Z_MARGIN, target_size="Z"))
         time.sleep(self.WAIT_TIME)
         self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN , target_size="Z"))
         time.sleep(self.WAIT_TIME)
@@ -326,108 +237,99 @@ class MasterNode(Node):
         if release_gripper:
             self.call(self.cli_g, SetBool.Request(data=False))
             time.sleep(self.WAIT_TIME)
-        return True
-
-    def visual_insert(self, target_color, layer_index, release_gripper=True, yaw_offset=0.0, offset_studs_x=0.0, offset_studs_y=0.0):
-        self.get_logger().info(f"\n--- VISUAL STACK: [{target_color.upper()}] (Layer +{layer_index}, Y Offset: {offset_studs_y}) ---")
-        time.sleep(1.0)
-
-        p = self.find_target_with_retry(target_color)
-        if not p: return False
-       
-        target_yaw = p.yaw + yaw_offset + self.YAW_TUNE
-        while target_yaw > 90.0: target_yaw -= 180.0
-        while target_yaw < -90.0: target_yaw += 180.0
-
-        self.get_logger().info(f"🔄 [YAW 회전] 시각 보정 기반 회전: {target_yaw:.1f}도")
-        req_y = GetTargetPose.Request()
-        req_y.yaw = target_yaw; req_y.target_size = "YAW"
-        self.call(self.cli_r, req_y)
-        time.sleep(self.WAIT_TIME)
-
-        p = self.find_target_with_retry(target_color)
-        if not p: return False
-
-        # 메모리 로직
-        self.last_perfect_pose = p
-
-        dx = offset_studs_x * self.STUD_PITCH
-        dy = offset_studs_y * self.STUD_PITCH
-        yaw_rad = math.radians(p.yaw)
-        real_offset_x = dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
-        real_offset_y = dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
-
-        target_x = p.x + real_offset_x
-        target_y = p.y + real_offset_y
-
-        self.get_logger().info(f"➡️ [XY 이동] 시각 보정 기반 최적 오프셋 적용")
-        req_xy = GetTargetPose.Request()
-        req_xy.x = target_x; req_xy.y = target_y; req_xy.target_size = "XY"
-        self.call(self.cli_r, req_xy)
-        time.sleep(self.WAIT_TIME)
-
-        z_move = (p.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-       
-        self.call(self.cli_r, GetTargetPose.Request(z=z_move - self.Z_MARGIN, target_size="Z"))
-        time.sleep(self.WAIT_TIME)
-        self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN , target_size="Z"))
-        time.sleep(self.WAIT_TIME)
-
-        if release_gripper:
-            self.call(self.cli_g, SetBool.Request(data=False))
-            time.sleep(self.WAIT_TIME)
+            
         self.call(self.cli_r, GetTargetPose.Request(z=-50.0, target_size="Z"))
         time.sleep(self.WAIT_TIME)
         return True
 
-    def get_best_build_plan(self, current_inventory):
-        recipes = {
-            'studs_y': {'4x2_red': 2, '2x2_red': 2, '2x2_yellow': 1},
-            'battery': {'2x2_yellow': 1, '2x2_blue': 1},
-            'magnet': {'2x2_blue': 1, '2x2_red': 1},
-            'e_stop': {'2x2_red': 1, '4x2_yellow': 1},
-            'carrot': {'2x2_blue': 1, '2x2_yellow': 2},
-            'traffic_light': {'2x2_red': 1, '2x2_yellow': 1, '2x2_blue': 1},
-            'small_tree': {'2x2_red': 1, '4x2_red': 1, '2x2_yellow': 1},
-            'hammer': {'4x2_blue': 1, '2x2_red': 2},
-            'big_carrot': {'2x2_yellow': 2, '4x2_yellow': 1, '2x2_blue': 1},
-            'burger': {'4x2_yellow': 2, '4x2_red': 1, '2x2_red': 1},
-            'ice_cream': {'2x2_yellow': 2, '4x2_yellow': 1, '2x2_red': 1, '2x2_blue': 1},
-            'big_tree': {'2x2_yellow': 1, '2x2_red': 2, '4x2_red': 2}
-        }
-        best_plan = []
-        min_remainder = sum(current_inventory.values())
+    def visual_insert(self, target_color, layer_index, release_gripper=True, yaw_offset=0.0, offset_studs_x=0.0, offset_studs_y=0.0):
+        self.get_logger().info(f"\n--- VISUAL INSERT (정밀 모드): [{target_color.upper()}] ---")
 
-        def dfs(inv, current_plan):
-            nonlocal best_plan, min_remainder
-            made_any = False
-            for name, recipe in recipes.items():
-                can_make = True
-                for color, count in recipe.items():
-                    if inv.get(color, 0) < count:
-                        can_make = False
-                        break
-                if can_make:
-                    made_any = True
-                    new_inv = inv.copy()
-                    for color, count in recipe.items():
-                        new_inv[color] -= count
-                    dfs(new_inv, current_plan + [name])
-           
-            if not made_any:
-                remainder = sum(inv.values())
-                if remainder < min_remainder:
-                    min_remainder = remainder
-                    best_plan = current_plan
-                elif remainder == min_remainder:
-                    if len(current_plan) < len(best_plan):
-                        best_plan = current_plan
+        # 1. 최초 스캔 및 대략적인 XY 이동
+        self.get_logger().info("1. 최초 스캔 및 중앙으로 대략적인 이동")
+        p1 = self.find_target_with_retry(target_color)
+        if not p1: return False
 
-        dfs(current_inventory, [])
-        return best_plan
+        # 🌟 치명적 버그 수정: 블라인드 이동 시 홈(Home) 기준 좌표가 필요하므로 p1을 저장합니다.
+        self.last_perfect_pose = p1
 
-    # --- 2~3개 조합 (Visual Insert 적용) ---
+        # 🌟 관절 한계 도달 방지: 목표물 위 150mm 지점까지 Z축 미리 하강
+        z_move_total_initial = (p1.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        z_pre_to_move = z_move_total_initial - self.Z_PRE_LOWER_MARGIN
+        z_already_moved = 0.0
+        if z_pre_to_move > 0:
+            self.get_logger().info(f"...Z축 미리 하강 ({z_pre_to_move:.1f}mm)")
+            self.call(self.cli_r, GetTargetPose.Request(z=z_pre_to_move, target_size="Z"))
+            time.sleep(self.WAIT_TIME)
+            z_already_moved = z_pre_to_move
 
+        req_xy1 = GetTargetPose.Request(x=p1.x, y=p1.y, target_size="XY")
+        self.call(self.cli_r, req_xy1)
+        time.sleep(self.WAIT_TIME)
+        self.get_logger().info("...대략적인 중앙 이동 완료.")
+
+        # 2. 중앙에서 정밀 재스캔
+        self.get_logger().info("2. 중앙에서 정밀 재스캔 (X, Y, Z, Yaw)")
+        p2 = self.find_target_with_retry(target_color)
+        if not p2: return False
+
+        # 3. YAW 회전
+        self.get_logger().info("3. YAW 정렬 시작")
+        target_yaw = p2.yaw + yaw_offset + self.YAW_TUNE
+        if target_color.startswith("2x2_"):
+            target_yaw = self.fold_2x2_yaw(target_yaw)
+        else:
+            target_yaw = self.normalize_yaw(target_yaw)
+
+        self.get_logger().info(f"🔄 [YAW 회전] 시각 보정 기반 회전: {target_yaw:.1f}도")
+        req_y = GetTargetPose.Request(yaw=target_yaw, target_size="YAW")
+        self.call(self.cli_r, req_y)
+        time.sleep(self.WAIT_TIME)
+        self.get_logger().info(f"...YAW 정렬 완료 ({target_yaw:.1f}도)")
+
+        # 4. YAW 회전 후 최종 XY 위치 재스캔 및 이동
+        self.get_logger().info("4. YAW 정렬 후 최종 XY 좌표 재스캔 및 이동")
+        p3 = self.find_target_with_retry(target_color)
+        if not p3: return False
+        
+
+        dx = offset_studs_x * self.STUD_PITCH
+        dy = offset_studs_y * self.STUD_PITCH
+        yaw_for_offset = self.fold_2x2_yaw(p3.yaw) if (self.is_2x2_pose(p3) or target_color.startswith("2x2_")) else p3.yaw
+        yaw_rad = math.radians(yaw_for_offset)
+        real_offset_x = dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
+        real_offset_y = dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
+
+        target_x = p3.x + real_offset_x
+        target_y = p3.y + real_offset_y
+
+        req_xy2 = GetTargetPose.Request(x=target_x, y=target_y, target_size="XY")
+        self.call(self.cli_r, req_xy2)
+        time.sleep(self.WAIT_TIME)
+        self.get_logger().info("...최종 XY 이동 완료.")
+
+        # 5. Z 하강 및 놓기
+        self.get_logger().info("5. Z 하강 및 놓기")
+        z_move_total_final = (p3.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
+        z_remaining = z_move_total_final - z_already_moved
+        
+        self.call(self.cli_r, GetTargetPose.Request(z=z_remaining - self.Z_MARGIN, target_size="Z"))
+        time.sleep(self.WAIT_TIME)
+        
+        self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
+        time.sleep(self.WAIT_TIME)
+
+        if release_gripper:
+            self.call(self.cli_g, SetBool.Request(data=False))
+            time.sleep(self.WAIT_TIME)
+            
+        self.call(self.cli_r, GetTargetPose.Request(z=-50.0, target_size="Z"))
+        time.sleep(self.WAIT_TIME)
+        return True
+
+    # =========================================================================
+    # 8번 코드 레시피
+    # =========================================================================
     def build_battery(self):
         self.get_logger().info("🔋 [배터리] 노란색(Pick) -> 파란색(Base)")
         if self.pick_target("2x2_yellow"):
@@ -457,7 +359,6 @@ class MasterNode(Node):
                 self.call(self.cli_h, Trigger.Request())
                 if self.pick_target("2x2_yellow"):
                     self.call(self.cli_h, Trigger.Request())
-                    # 1층에 놓인 노란색을 베이스로 삼아 1층 높이 더 올리기
                     self.visual_insert("2x2_yellow", layer_index=1)
                     self.get_logger().info("✅ 당근 완성!")
 
@@ -469,20 +370,18 @@ class MasterNode(Node):
                 self.call(self.cli_h, Trigger.Request())
                 if self.pick_target("2x2_red"):
                     self.call(self.cli_h, Trigger.Request())
-                    # 파란색이 가려졌으니, 방금 놓은 노란색을 타겟으로!
                     self.visual_insert("2x2_yellow", layer_index=1)
                     self.get_logger().info("✅ 신호등 완성!")
 
     def build_small_tree(self):
         self.get_logger().info("🌳 [작은 나무] 빨강4x2(Pick) -> 노랑2x2(Base) -> 빨강2x2(Pick)")
-        if self.pick_target("4x2_red"):
+        if self.pick_target("4x2_green"):
             self.call(self.cli_h, Trigger.Request())
             if self.visual_insert("2x2_yellow", layer_index=1):
                 self.call(self.cli_h, Trigger.Request())
-                if self.pick_target("2x2_red"):
+                if self.pick_target("2x2_green"):
                     self.call(self.cli_h, Trigger.Request())
-                    # 가려진 2x2 노랑 대신, 방금 놓은 4x2 빨강을 타겟으로!
-                    self.visual_insert("4x2_red", layer_index=1)
+                    self.visual_insert("4x2_green", layer_index=)
                     self.get_logger().info("✅ 작은 나무 완성!")
 
     def build_hammer(self):
@@ -493,22 +392,18 @@ class MasterNode(Node):
                 self.call(self.cli_h, Trigger.Request())
                 if self.pick_target("4x2_blue"):
                     self.call(self.cli_h, Trigger.Request())
-                    # 가려진 0층 빨강 대신 1층 빨강을 타겟으로! 간섭 회피용 90도 회전
                     self.visual_insert("2x2_red", layer_index=1, yaw_offset=0.0)
                     self.get_logger().info("✅ 망치 완성!")
 
-    # --- 4개 조합 (Big Carrot, Burger) ---
     def build_big_carrot(self):
         self.get_logger().info("🥕🥕 [큰 당근] 노랑2x2(Pick) -> 노랑2x2(Base) -> 노랑4x2(Pick) -> 파랑2x2(Pick)")
         if self.pick_target("2x2_yellow"):
             self.call(self.cli_h, Trigger.Request())
             if self.visual_insert("2x2_yellow", layer_index=1):
-               
                 self.call(self.cli_h, Trigger.Request())
                 if self.pick_target("4x2_yellow"):
                     self.call(self.cli_h, Trigger.Request())
                     if self.visual_insert("2x2_yellow", layer_index=2, yaw_offset=0.0):
-                       
                         self.call(self.cli_h, Trigger.Request())
                         if self.pick_target("2x2_blue"):
                             self.call(self.cli_h, Trigger.Request())
@@ -521,20 +416,15 @@ class MasterNode(Node):
             self.call(self.cli_h, Trigger.Request())
             if self.visual_insert("4x2_yellow", layer_index=1, offset_studs_y=-1.0):
                 saved_base_bun_pose = self.last_perfect_pose
-               
                 self.call(self.cli_h, Trigger.Request())
                 if self.pick_target("2x2_red"):
                     self.call(self.cli_h, Trigger.Request())
-                   
-                    # 🌟 간섭 회피를 위해 yaw_offset=0.0 으로 복구
                     if self.visual_insert("4x2_red", layer_index=0, yaw_offset=0.0, offset_studs_y=3.0):
-                       
                         self.call(self.cli_h, Trigger.Request())
                         if self.pick_target("4x2_yellow"):
                             self.call(self.cli_h, Trigger.Request())
-                           
                             if saved_base_bun_pose:
-                                self.get_logger().info("🧠 [메모리 사용] 덩어리 인식 오류 방지: 최초 바닥 빵의 좌표를 기억해서 정중앙에 덮습니다!")
+                                self.get_logger().info("🧠 [메모리 사용] 최초 바닥 빵의 좌표를 기억해서 정중앙에 덮습니다!")
                                 self.blind_insert(saved_base_bun_pose, layer_index=2, offset_studs_y=1.0)
                                 self.get_logger().info("✅ 버거 완성!")
                             else:
@@ -542,7 +432,6 @@ class MasterNode(Node):
 
     def build_ice_cream(self):
         self.get_logger().info("🍦 [아이스크림] 모듈형 조립 전략")
-
         self.get_logger().info("[Phase 1] 하단 조립: 노랑4x2(Pick) -> 노랑2x2(Base)")
         if self.pick_target("4x2_yellow"):
             self.call(self.cli_h, Trigger.Request())
@@ -577,7 +466,6 @@ class MasterNode(Node):
 
     def build_studs_y(self):
         self.get_logger().info("🧱 [초기화] 맨 처음 2x2_yellow 위치 스캔 및 기억")
-        # 페이즈 4를 위해 노란색 블록의 위치를 가장 먼저 찾아 저장합니다.
         p_yellow = self.find_target_with_retry("2x2_yellow")
         if not p_yellow:
             self.get_logger().warn("❌ 바닥에 2x2_yellow가 안 보입니다. 조립을 취소합니다.")
@@ -588,19 +476,15 @@ class MasterNode(Node):
         self.get_logger().info("🧱 [Phase 1] 4x2_red(-1.85) 파지 -> 2x2_red(0.0) 결합 (그리퍼 유지)")
         if self.pick_target("4x2_red", offset_studs_y=-1.84):
             self.call(self.cli_h, Trigger.Request())
-            
-            # 그리퍼 열지 않고 결합
             if self.visual_insert("2x2_red", layer_index=1, offset_studs_y=0.0, release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
-                time.sleep(1.0) # 카메라가 흔들림을 잡고 바닥을 볼 수 있도록 약간의 대기
+                time.sleep(1.0) 
 
                 self.get_logger().info("🧱 [Phase 2] 바닥의 다른 4x2_red 스캔 및 6x2 조립 (그리퍼 해제)")
                 p_4x2_base = self.find_target_with_retry("4x2_red")
                 if not p_4x2_base:
                     self.get_logger().warn("❌ 바닥에 다른 4x2_red가 안 보입니다.")
                     return
-                
-                # 시야가 가려지기 전의 정확한 바닥 좌표를 저장!
                 saved_6x2_pose = p_4x2_base 
                 
                 if self.blind_insert(saved_6x2_pose, layer_index=1, offset_studs_y=-3.0, release_gripper=True):
@@ -609,57 +493,61 @@ class MasterNode(Node):
                     self.get_logger().info("🧱 [Phase 3] 2x2_red 파지 -> 6x2 중심에 결합 (그리퍼 유지)")
                     if self.pick_target("2x2_red", offset_studs_y=-0.2):
                         self.call(self.cli_h, Trigger.Request())
-                        
-                        # 아까 저장해둔 깨끗한 6x2 베이스 좌표로 블라인드 이동
                         if self.blind_insert(saved_6x2_pose, layer_index=2, offset_studs_y=-1.0, release_gripper=False):
                             self.call(self.cli_h, Trigger.Request())
 
                             self.get_logger().info("🧱 [Phase 4] 덩어리를 2x2_yellow 중앙에 최종 결합")
-                            # 맨 처음에 기억해둔 노란색 블록 위치로 블라인드 이동 후 그리퍼 해제
                             if self.blind_insert(saved_yellow_pose, layer_index=1.5, offset_studs_y=0.0):
-                                self.get_logger().info("✅ 최종 조립 시퀀스 완벽 종료!")
+                                self.get_logger().info("✅ 최종 조립 시퀀 완벽 종료!")
 
+    # =========================================================================
+    # 8번 코드 수동 실행 모드
+    # =========================================================================
     def run(self):
-        self.get_logger().info("🚀 STARTING VISUAL-STACK ASSEMBLY SEQUENCE (Full Recipe Mode)")
-        self.call(self.cli_h, Trigger.Request())
+        self.get_logger().info("🚀 STARTING VISUAL-STACK ASSEMBLY SEQUENCE (Keyboard Select Mode)")
+        home_res = self.call(self.cli_h, Trigger.Request())
+        if home_res is None or not home_res.success:
+            self.get_logger().error("❌ 시작 HOME 이동 실패. 조립을 시작하지 않습니다.")
+            return
         self.call(self.cli_g, SetBool.Request(data=False))
         time.sleep(1.0)
        
-        self.get_logger().info("👀 필드 블록 스캔 중...")
-        inventory = {
-            "2x2_yellow": self.count_color("2x2_yellow"),
-            "2x2_blue": self.count_color("2x2_blue"),
-            "2x2_red": self.count_color("2x2_red"),
-            "2x2_green": self.count_color("2x2_green"),
-            "4x2_yellow": self.count_color("4x2_yellow"),
-            "4x2_red": self.count_color("4x2_red"),
-            "4x2_blue": self.count_color("4x2_blue")
+        actions = {
+            "1": self.build_battery, "battery": self.build_battery, "배터리": self.build_battery,
+            "2": self.build_magnet, "magnet": self.build_magnet, "자석": self.build_magnet,
+            "3": self.build_e_stop, "estop": self.build_e_stop, "비상정지": self.build_e_stop,
+            "4": self.build_carrot, "carrot": self.build_carrot, "당근": self.build_carrot,
+            "5": self.build_traffic_light, "traffic": self.build_traffic_light, "신호등": self.build_traffic_light,
+            "6": self.build_small_tree, "tree": self.build_small_tree, "작은나무": self.build_small_tree,
+            "7": self.build_hammer, "hammer": self.build_hammer, "망치": self.build_hammer,
+            "8": self.build_big_carrot, "bigcarrot": self.build_big_carrot, "큰당근": self.build_big_carrot,
+            "9": self.build_burger, "burger": self.build_burger, "버거": self.build_burger,
+            "10": self.build_ice_cream, "icecream": self.build_ice_cream, "아이스크림": self.build_ice_cream,
+            "11": self.build_studs_y, "studs_y": self.build_studs_y
         }
-        self.get_logger().info(f"📦 현재 인벤토리: {inventory}")
 
-        best_plan = self.get_best_build_plan(inventory)
-       
-        if not best_plan:
-            self.get_logger().warn("❌ 조립 가능한 조합이 없습니다.")
-        else:
-            self.get_logger().info(f"🧠 최적 계획: {best_plan}")
-            for item in best_plan:
-                self.get_logger().info(f"▶️ 작업 시작: {item.upper()}")
-                if item == 'battery': self.build_battery()
-                elif item == 'studs_y': self.build_studs_y()
-                elif item == 'magnet': self.build_magnet()
-                elif item == 'e_stop': self.build_e_stop()
-                elif item == 'carrot': self.build_carrot()
-                elif item == 'traffic_light': self.build_traffic_light()
-                elif item == 'small_tree': self.build_small_tree()
-                elif item == 'hammer': self.build_hammer()
-                elif item == 'big_carrot': self.build_big_carrot()
-                elif item == 'burger': self.build_burger()
-                elif item == 'ice_cream': self.build_ice_cream()
-                elif item == 'big_tree': self.build_big_tree()
-                   
-                self.call(self.cli_h, Trigger.Request())
-                time.sleep(1.0)
+        print("\n=== Master Node Assembly Keyboard Select ===")
+        print("1: 배터리 / 2: 자석 / 3: 비상정지 / 4: 당근 / 5: 신호등 / 6: 작은나무")
+        print("7: 망치 / 8: 큰당근 / 9: 버거 / 10: 아이스크림 / 11: studs_y")
+        print("q: 종료")
+
+        while rclpy.ok():
+            user_input = input("\n조립할 항목을 선택하세요 [1~11/q]: ").strip().replace(" ", "").lower()
+            if user_input in ("q", "quit", "exit", "종료"):
+                self.get_logger().info("조립 시퀀스를 종료합니다.")
+                break
+
+            action = actions.get(user_input)
+            if action is None:
+                print("잘못된 입력입니다. 1~11 또는 q 중에서 선택하세요.")
+                continue
+
+            self.get_logger().info(f"▶️ 작업 시작: {user_input}")
+            action()
+            
+            self.call(self.cli_h, Trigger.Request())
+            time.sleep(1.0)
+            self.get_logger().info("✅ 개별 조립 완료")
 
         self.call(self.cli_h, Trigger.Request())
         self.get_logger().info("🎉 ALL SEQUENCE DONE")

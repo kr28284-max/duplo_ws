@@ -596,9 +596,11 @@ class MasterNode(Node):
         yaw_offset=0.0,
         offset_studs_x=0.0,
         offset_studs_y=0.0,
-        pre_xy_lower=True,
+        pre_xy_lower=False,  # (호환용) 더 이상 사용 안 함: Z 선하강/중간 재촬영 제거됨
     ):
-        target_pose = pose
+        # AMR 탑재 로봇팔 load_node 방식:
+        # HOME에서 1회 측정한 pose 하나로 YAW + XY + Z 접근을 한 모션에 합친다.
+        # (Z 7cm 선하강 / 중간 재촬영 모두 제거)
         target_x, target_y = self.calc_target_xy(pose, offset_studs_x, offset_studs_y)
         if self.is_2x2_pose(pose):
             target_yaw = self.fold_2x2_yaw(pose.yaw + yaw_offset + self.YAW_TUNE)
@@ -607,79 +609,23 @@ class MasterNode(Node):
             )
         else:
             target_yaw = self.normalize_yaw(pose.yaw + yaw_offset + self.YAW_TUNE)
+
         z_move = (pose.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-        z_already_moved = self.PRE_XY_LOWER if pre_xy_lower else 0.0
-        z_final_move = z_move - z_already_moved
-        final_xy_target_size = "XY"
 
-        if pre_xy_lower:
-            self.get_logger().info(f"⬇️ [FAST] XY 전 Z {self.PRE_XY_LOWER}mm 선하강")
-            self.call(self.cli_r, GetTargetPose.Request(z=self.PRE_XY_LOWER, target_size="Z"))
-            time.sleep(self.WAIT_TIME)
-
-        retry_class_name = str(getattr(pose, "class_name", "")).strip()
-        if pre_xy_lower and retry_class_name:
-            scan_x, scan_y = self.calc_target_xy(
-                pose,
-                offset_studs_x=2.0303,
-                offset_studs_y=3.2114,
-            )
-            self.get_logger().info(
-                f"➡️ [PRECISION] 재촬영 위치 이동: x={scan_x:.4f}m, y={scan_y:.4f}m"
-            )
-            self.call(self.cli_r, GetTargetPose.Request(x=scan_x, y=scan_y, target_size="XY"))
-            time.sleep(self.WAIT_TIME)
-
-            refined_pose = self.find_target_with_retry(retry_class_name)
-            if refined_pose:
-                target_x, target_y = self.calc_target_xy(
-                    refined_pose,
-                    offset_studs_x,
-                    offset_studs_y,
-                )
-                if self.is_2x2_pose(refined_pose):
-                    target_yaw = self.fold_2x2_yaw(refined_pose.yaw + yaw_offset + self.YAW_TUNE)
-                    self.get_logger().info(
-                        f"🔄 [PRECISION 재촬영][2x2] {retry_class_name}: "
-                        f"x={target_x:.4f}m, y={target_y:.4f}m, "
-                        f"vision_yaw={refined_pose.yaw:.1f}도 -> wrist_yaw={target_yaw:.1f}도"
-                    )
-                else:
-                    target_yaw = self.normalize_yaw(refined_pose.yaw + yaw_offset + self.YAW_TUNE)
-                    self.get_logger().info(
-                        f"🔄 [PRECISION 재촬영] {retry_class_name}: "
-                        f"x={target_x:.4f}m, y={target_y:.4f}m, "
-                        f"vision_yaw={refined_pose.yaw:.1f}도 -> wrist_yaw={target_yaw:.1f}도"
-                    )
-            else:
-                target_x -= scan_x
-                target_y -= scan_y
-                final_xy_target_size = "XY_DELTA"
-                self.get_logger().warn(
-                    f"⚠️ [PRECISION] 재촬영 실패. 재촬영 이동분을 빼고 fallback 이동: "
-                    f"dx={target_x:.4f}m, dy={target_y:.4f}m"
-                )
-        else:
-            self.get_logger().info(f"➡️ [FAST] 최초 비전 XY 사용: x={target_x:.4f}m, y={target_y:.4f}m")
-
-        self.get_logger().info(f"➡️ [FAST] 최종 XY 이동: x={target_x:.4f}m, y={target_y:.4f}m")
-        self.call(self.cli_r, GetTargetPose.Request(x=target_x, y=target_y, target_size=final_xy_target_size))
-        time.sleep(self.WAIT_TIME)
-        self.get_logger().info(f"🔄 [FAST] YAW 이동: {target_yaw:.1f}도")
-        self.call(self.cli_r, GetTargetPose.Request(yaw=target_yaw, target_size="YAW"))
-        time.sleep(self.WAIT_TIME)
-
-        z_move = (target_pose.z * 1000.0 + self.Z_OFF) - (self.BLOCK_H * layer_index)
-        z_final_move = z_move - z_already_moved
+        # [1] YAW + XY + Z 동시 이동 (물체 바로 위 Z_MARGIN 지점까지 대각선 접근)
         self.get_logger().info(
-            f"⬇️ [FAST] 최종 비전 Z 사용: total={z_move:.1f}mm, "
-            f"remaining={z_final_move:.1f}mm"
+            f"➡️ [ONE-SHOT] x={target_x:.4f}m, y={target_y:.4f}m, "
+            f"yaw={target_yaw:.1f}도, z_approach={z_move - self.Z_MARGIN:.1f}mm"
         )
-        self.call(self.cli_r, GetTargetPose.Request(z=z_final_move - self.Z_MARGIN, target_size="Z"))
+        self.call(self.cli_r, GetTargetPose.Request(
+            x=target_x, y=target_y, z=z_move - self.Z_MARGIN,
+            yaw=target_yaw, target_size="APPROACH"
+        ))
         time.sleep(self.WAIT_TIME)
+
+        # [2] 최종 수직 접근 (yaw 회전 후에도 tool Z축은 수직 유지)
         self.call(self.cli_r, GetTargetPose.Request(z=self.Z_MARGIN, target_size="Z"))
         time.sleep(self.WAIT_TIME)
-        return True
 
     def pick_target(self, color, layer_index=0, offset_studs_x=0.0, offset_studs_y=0.0):
         self.get_logger().info(f"\n--- PICK TARGET: [{color.upper()}] ---")
@@ -687,13 +633,12 @@ class MasterNode(Node):
         p = self.find_target_with_retry(color)
         if not p: return False
 
-        if not self.move_fast_from_pose(
+        self.move_fast_from_pose(
             p,
             layer_index=layer_index,
             offset_studs_x=offset_studs_x,
             offset_studs_y=offset_studs_y,
-        ):
-            return False
+        )
 
         self.call(self.cli_g, SetBool.Request(data=True))
         time.sleep(self.WAIT_TIME)
@@ -706,15 +651,14 @@ class MasterNode(Node):
         self.get_logger().info(f"\n--- BLIND STACK (메모리 사용): Layer {layer_index} (Y Offset: {offset_studs_y}) ---")
         time.sleep(1.0)
 
-        if not self.move_fast_from_pose(
+        self.move_fast_from_pose(
             base_pose,
             layer_index=layer_index,
             yaw_offset=yaw_offset,
             offset_studs_x=offset_studs_x,
             offset_studs_y=offset_studs_y,
             pre_xy_lower=False,
-        ):
-            return False
+        )
 
         if release_gripper:
             self.call(self.cli_g, SetBool.Request(data=False))
@@ -730,6 +674,8 @@ class MasterNode(Node):
         layer_index,
         release_gripper=True,
         yaw_offset=0.0,
+        # offset_studs_x=0.3125,
+        # offset_studs_y=0.15625,
         offset_studs_x=0.0,
         offset_studs_y=0.0,
         pre_xy_lower=False,
@@ -742,15 +688,14 @@ class MasterNode(Node):
        
         self.last_perfect_pose = p
 
-        if not self.move_fast_from_pose(
+        self.move_fast_from_pose(
             p,
             layer_index=layer_index,
             yaw_offset=yaw_offset,
             offset_studs_x=offset_studs_x,
             offset_studs_y=offset_studs_y,
             pre_xy_lower=pre_xy_lower,
-        ):
-            return False
+        )
 
         if release_gripper:
             self.call(self.cli_g, SetBool.Request(data=False))
@@ -785,7 +730,7 @@ class MasterNode(Node):
         self.get_logger().info("🥕 [당근] 초록 (Pick) -> 노랑 (그리퍼 유지) -> 노란색(base)")
         if self.pick_target("2x2_green"):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("2x2_yellow", layer_index=1, pre_xy_lower=True,release_gripper=False):
+            if self.visual_insert("2x2_yellow", layer_index=0.9, pre_xy_lower=True,release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
                 if self.visual_insert("2x2_yellow", layer_index=1.8, pre_xy_lower=True):
                     self.get_logger().info("✅ 당근 완성!")
@@ -794,9 +739,9 @@ class MasterNode(Node):
         self.get_logger().info("🚦 [신호등] 노란색(Pick) -> 초록색(Base) -> 빨간색(Pick)")
         if self.pick_target("2x2_red"):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("2x2_yellow", layer_index=1, pre_xy_lower=True,release_gripper=False):
+            if self.visual_insert("2x2_yellow", layer_index=0.9, pre_xy_lower=True,release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
-                if self.visual_insert("2x2_green", layer_index=1.8, pre_xy_lower=True):
+                if self.visual_insert("2x2_green", layer_index=1.7, pre_xy_lower=True):
                     self.get_logger().info("✅ 신호등 완성!")
 
     def build_small_tree(self):
@@ -812,52 +757,84 @@ class MasterNode(Node):
         self.get_logger().info("🔨 [망치] 빨강2x2(Pick) -> 빨강2x2(Base) -> 파랑4x2(Pick)")
         if self.pick_target("4x2_blue"):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("2x2_red", layer_index=1, pre_xy_lower=True, release_gripper=False):
+            if self.visual_insert("2x2_red", layer_index=0.9, pre_xy_lower=True, release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
                 if self.visual_insert("2x2_red", layer_index=1.8, yaw_offset=0.0, pre_xy_lower=True):
                     self.get_logger().info("✅ 망치 완성!")
 
     def build_big_carrot(self):
         self.get_logger().info("🥕🥕 [큰 당근] 노랑2x2(Pick) -> 노랑2x2(Base) -> 노랑4x2(Pick) -> 파랑2x2(Pick)")
-        if self.pick_target("2x2_yellow"):
+        if self.pick_target("2x2_green"):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("2x2_yellow", layer_index=1, pre_xy_lower=True):
+            if self.visual_insert("4x2_yellow", layer_index=0.9, pre_xy_lower=True, release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
-                if self.pick_target("4x2_yellow"):
-                    self.call(self.cli_h, Trigger.Request())
-                    if self.visual_insert("2x2_yellow", layer_index=2, yaw_offset=0.0, pre_xy_lower=True):
+                if self.visual_insert("2x2_yellow", layer_index=1.8, yaw_offset=0.0, pre_xy_lower=True, release_gripper=False):
                         self.call(self.cli_h, Trigger.Request())
-                        if self.pick_target("2x2_blue"):
-                            self.call(self.cli_h, Trigger.Request())
-                            self.visual_insert("4x2_yellow", layer_index=1, pre_xy_lower=True)
+                        if self.visual_insert("2x2_yellow", layer_index=2.7, pre_xy_lower=True, release_gripper=False):
                             self.get_logger().info("✅ 대왕 당근 완성!")
 
+    # def build_burger(self):
+    #     self.get_logger().info("🍔 [버거] 노랑4x2(Base) -> 빨강4x2(Offset Y -1) -> 빨강2x2(Offset Y +2) -> 노랑4x2(Top)")
+    #     if self.pick_target("4x2_red"):
+    #         self.call(self.cli_h, Trigger.Request())
+    #         if self.visual_insert("4x2_yellow", layer_index=1, offset_studs_y=-1.0):
+    #             saved_base_bun_pose = self.last_perfect_pose
+    #             self.call(self.cli_h, Trigger.Request())
+    #             if self.pick_target("2x2_red"):
+    #                 self.call(self.cli_h, Trigger.Request())
+    #                 if self.visual_insert("4x2_red", layer_index=0, yaw_offset=0.0, offset_studs_y=3.0):
+    #                     self.call(self.cli_h, Trigger.Request())
+    #                     if self.pick_target("4x2_yellow"):
+    #                         self.call(self.cli_h, Trigger.Request())
+    #                         if saved_base_bun_pose:
+    #                             self.get_logger().info("🧠 [메모리 사용] 최초 바닥 빵의 좌표를 기억해서 정중앙에 덮습니다!")
+    #                             self.blind_insert(saved_base_bun_pose, layer_index=2, offset_studs_y=1.0)
+    #                             self.get_logger().info("✅ 버거 완성!")
+    #                         else:
+    #                             self.get_logger().warn("❌ 저장된 좌표가 없습니다. 조립 실패.")
+
+
     def build_burger(self):
-        self.get_logger().info("🍔 [버거] 노랑4x2(Base) -> 빨강4x2(Offset Y -1) -> 빨강2x2(Offset Y +2) -> 노랑4x2(Top)")
-        if self.pick_target("4x2_red"):
+        self.get_logger().info("🍔 [버거] 4x2_yellow(Pick) -> 4x2_red 결합 -> 2x2_red로 6x2 조립 -> 저장된 4x2_yellow에 최종 결합")
+
+        self.get_logger().info("🧱 [Phase 1] 4x2_yellow 파지")
+        if self.pick_target("4x2_yellow", offset_studs_y=0):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("4x2_yellow", layer_index=1, offset_studs_y=-1.0, pre_xy_lower=True):
-                saved_base_bun_pose = self.last_perfect_pose
+
+            self.get_logger().info("🧱 [Phase 2] 바닥의 다른 4x2_yellow 위치 스캔 및 기억")
+            p_yellow = self.find_target_with_retry("4x2_yellow")
+            if not p_yellow:
+                self.get_logger().warn("❌ 바닥에 다른 4x2_yellow가 안 보입니다. 조립을 취소합니다.")
+                return
+            saved_yellow_pose = p_yellow
+            self.call(self.cli_h, Trigger.Request())
+
+            self.get_logger().info("🧱 [Phase 3] 들고 있는 4x2_yellow -> 4x2_red 결합 (그리퍼 유지)")
+            if self.visual_insert("4x2_red", layer_index=0.8, offset_studs_y=-1.0, release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
-                if self.pick_target("2x2_red"):
+                time.sleep(1.0) 
+
+                self.get_logger().info("🧱 [Phase 4] 바닥의 2x2_red 스캔 및 6x2 조립 (그리퍼 유지)")
+                p_2x2_base = self.find_target_with_retry("2x2_red")
+                if not p_2x2_base:
+                    self.get_logger().warn("❌ 바닥에 2x2_red가 안 보입니다.")
+                    return
+                saved_6x2_pose = p_2x2_base
+
+                if self.blind_insert(saved_6x2_pose, layer_index=0.8, offset_studs_y=2.0, release_gripper=False):
                     self.call(self.cli_h, Trigger.Request())
-                    if self.visual_insert("4x2_red", layer_index=0, yaw_offset=0.0, offset_studs_y=3.0, pre_xy_lower=True):
-                        self.call(self.cli_h, Trigger.Request())
-                        if self.pick_target("4x2_yellow"):
-                            self.call(self.cli_h, Trigger.Request())
-                            if saved_base_bun_pose:
-                                self.get_logger().info("🧠 [메모리 사용] 최초 바닥 빵의 좌표를 기억해서 정중앙에 덮습니다!")
-                                self.blind_insert(saved_base_bun_pose, layer_index=2, offset_studs_y=1.0, pre_xy_lower=True)
-                                self.get_logger().info("✅ 버거 완성!")
-                            else:
-                                self.get_logger().warn("❌ 저장된 좌표가 없습니다. 조립 실패.")
+
+                    self.get_logger().info("🧱 [Phase 5] 덩어리를 처음 저장한 4x2_yellow에 최종 결합")
+                    if self.blind_insert(saved_yellow_pose, layer_index=1.9, offset_studs_y=0.0):
+                        self.get_logger().info("✅ 버거 완성!")
+
 
     def build_ice_cream(self):
         self.get_logger().info("🍦 [아이스크림] 모듈형 조립 전략")
         self.get_logger().info("[Phase 1] 하단 조립: 노랑4x2(Pick) -> 노랑2x2(Base)")
         if self.pick_target("4x2_yellow"):
             self.call(self.cli_h, Trigger.Request())
-            if not self.visual_insert("2x2_yellow", layer_index=1, pre_xy_lower=True):
+            if not self.visual_insert("2x2_yellow", layer_index=1):
                 self.get_logger().warn("❌ 하단 모듈 조립 실패")
                 return
 
@@ -865,26 +842,22 @@ class MasterNode(Node):
         self.call(self.cli_h, Trigger.Request())
         if self.pick_target("2x2_blue"):
             self.call(self.cli_h, Trigger.Request())
-            if not self.visual_insert("2x2_red", layer_index=0, offset_studs_y=2.0, pre_xy_lower=True):
+            if not self.visual_insert("2x2_red", layer_index=0, offset_studs_y=2.0):
                 self.get_logger().warn("❌ 파란색 블록 배치 실패")
                 return
 
         self.get_logger().info("[Phase 2-2] 노랑2x2(Pick) -> 파랑2x2(Base, offset_y=-1)로 결합")
         self.call(self.cli_h, Trigger.Request())
-        if self.pick_target("2x2_yellow"):
+        if self.pick_target("2x2_green"):
             self.call(self.cli_h, Trigger.Request())
-            if not self.visual_insert("2x2_blue", layer_index=1, offset_studs_y=-1.0, pre_xy_lower=True):
+            if not self.visual_insert("2x2_blue", layer_index=1, offset_studs_y=-1.0, release_gripper=False):
                 self.get_logger().warn("❌ 상단 모듈 결합 실패")
                 return
 
         self.get_logger().info(" [Phase 3] 최종 결합: 상단 모듈 들어서 하단 모듈(노랑4x2) 위에 꽂기!")
         self.call(self.cli_h, Trigger.Request())
-        if self.pick_target("2x2_yellow", layer_index=0.5):
-            self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("4x2_yellow", layer_index=2, pre_xy_lower=True):
+        if self.visual_insert("4x2_yellow", layer_index=2):
                 self.get_logger().info("✅🎉 5단 아이스크림 완벽하게 완성!")
-            else:
-                self.get_logger().warn("❌ 최종 층 올리기 실패")
 
     def build_studs_y(self):
         self.get_logger().info("🧱 [초기화] 맨 처음 2x2_yellow 위치 스캔 및 기억")
@@ -895,31 +868,31 @@ class MasterNode(Node):
         saved_yellow_pose = p_yellow
         self.call(self.cli_h, Trigger.Request())
 
-        self.get_logger().info("🧱 [Phase 1] 4x2_red(-1.85) 파지 -> 2x2_red(0.0) 결합 (그리퍼 유지)")
-        if self.pick_target("4x2_red", offset_studs_y=-1.84):
+        self.get_logger().info("🧱 [Phase 1] 4x2_green(-1.85) 파지 -> 2x2_green(0.0) 결합 (그리퍼 유지)")
+        if self.pick_target("4x2_green", offset_studs_y=0):
             self.call(self.cli_h, Trigger.Request())
-            if self.visual_insert("2x2_red", layer_index=1, offset_studs_y=0.0, release_gripper=False):
+            if self.visual_insert("4x2_green", layer_index=1, offset_studs_y=-1.0, release_gripper=False):
                 self.call(self.cli_h, Trigger.Request())
                 time.sleep(1.0) 
 
-                self.get_logger().info("🧱 [Phase 2] 바닥의 다른 4x2_red 스캔 및 6x2 조립 (그리퍼 해제)")
-                p_4x2_base = self.find_target_with_retry("4x2_red")
-                if not p_4x2_base:
-                    self.get_logger().warn("❌ 바닥에 다른 4x2_red가 안 보입니다.")
+                self.get_logger().info("🧱 [Phase 2] 바닥의 다른 4x2_green 스캔 및 6x2 조립 (그리퍼 해제)")
+                p_2x2_base = self.find_target_with_retry("2x2_green")
+                if not p_2x2_base:
+                    self.get_logger().warn("❌ 바닥에 다른 2x2_green가 안 보입니다.")
                     return
-                saved_6x2_pose = p_4x2_base 
+                saved_6x2_pose = p_2x2_base 
                 
-                if self.blind_insert(saved_6x2_pose, layer_index=1, offset_studs_y=-3.0, release_gripper=True):
+                if self.blind_insert(saved_6x2_pose, layer_index=1, offset_studs_y=2.0, release_gripper=True):
                     self.call(self.cli_h, Trigger.Request())
 
                     self.get_logger().info("🧱 [Phase 3] 2x2_red 파지 -> 6x2 중심에 결합 (그리퍼 유지)")
-                    if self.pick_target("2x2_red", offset_studs_y=-0.2):
+                    if self.pick_target("2x2_green", offset_studs_y=-0.2):
                         self.call(self.cli_h, Trigger.Request())
-                        if self.blind_insert(saved_6x2_pose, layer_index=2, offset_studs_y=-1.0, release_gripper=False):
+                        if self.blind_insert(saved_6x2_pose, layer_index=2, offset_studs_y=0.0, release_gripper=False):
                             self.call(self.cli_h, Trigger.Request())
 
                             self.get_logger().info("🧱 [Phase 4] 덩어리를 2x2_yellow 중앙에 최종 결합")
-                            if self.blind_insert(saved_yellow_pose, layer_index=1.5, offset_studs_y=0.0):
+                            if self.blind_insert(saved_yellow_pose, layer_index=2.5, offset_studs_y=0.0):
                                 self.get_logger().info("✅ 최종 조립 시퀀 완벽 종료!")
 
     def run(self):

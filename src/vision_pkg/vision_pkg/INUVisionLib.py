@@ -3491,8 +3491,11 @@ def estimate_pose_axes_from_obb3d(
     if len(edge_candidates) == 0:
         return None
 
-    # X축: 가장 긴 edge 방향
-    edge_candidates.sort(key=lambda x: x[0], reverse=True)
+    # # X축: 가장 긴 edge 방향
+    # edge_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # X축: 가장 짧은 edge 방향 (단축 기준)
+    edge_candidates.sort(key=lambda x: x[0], reverse=False)
     x_axis = normalize_vec(edge_candidates[0][1])
 
     if x_axis is None:
@@ -4586,7 +4589,7 @@ def search_assembly(
         # ============================================================
         # 💡 [조립체 전용 축 설정 및 12시(0도) 기준 각도 변환] 
         # ============================================================
-        assembly_target_axis = "major"  # 장축을 잡을 거면 "major", 단축을 잡을 거면 "minor"
+        assembly_target_axis = "minor"  # 장축을 잡을 거면 "major", 단축을 잡을 거면 "minor"
 
         # 1. OpenCV 이미지 좌표계 각도 (3시 방향 0도, 아래쪽이 양수)
         base_angle = obj.get("angle_deg", 0.0)
@@ -4598,7 +4601,7 @@ def search_assembly(
         # 3. 타겟 축(장축/단축) 반영
         if assembly_target_axis == "minor":
             # 단축을 잡기 위해 90도를 추가 회전
-            final_yaw = robot_yaw + 90.0
+            final_yaw = robot_yaw + 90
         else:
             final_yaw = robot_yaw
 
